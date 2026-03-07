@@ -14,31 +14,17 @@ Usage:
 import argparse
 import logging
 import os
+import sys
 import time
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-try:
-    import pyrealsense2 as rs
-except ImportError as exc:
-    raise ImportError(
-        "pyrealsense2 not found. Install: pip install pyrealsense2"
-    ) from exc
-
-from tracking_utils import (
-    build_estimator,
-    check_drift_and_reregister,
-    draw_tracking_vis,
-    get_sam3_mask,
-    intrinsics_to_K,
-    load_mesh,
-    load_sam3,
-    print_pose,
-    set_logging_format,
-    set_seed,
-)
+# Reason: append (not insert) so site-packages sam3 is found before
+# the project's sam3/ directory which would shadow it as a namespace package.
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 
 def main():
@@ -65,14 +51,34 @@ def main():
         "--confidence", type=float, default=0.5,
         help="SAM3 detection confidence threshold",
     )
-    parser.add_argument(
-        "--redetect_interval", type=float, default=5.0,
-        help="Seconds between SAM3 re-detection checks (0 = disabled)",
-    )
     parser.add_argument("--debug", type=int, default=1, help="Debug level (0=off, 1=vis, 2=save)")
-    parser.add_argument("--no-flip", action="store_true", help="Disable image flip")
-    parser.add_argument("--no-vis", action="store_true", help="Disable OpenCV visualization")
+    parser.add_argument("--no-vis", action="store_true", help="Disable visualization window")
     args = parser.parse_args()
+
+    display = None
+    if not args.no_vis:
+        from utils.display import TkDisplay
+        display = TkDisplay(title="ObjectTracker")
+
+    # Deferred imports: these trigger CUDA init via FoundationPose/PyTorch
+    try:
+        import pyrealsense2 as rs
+    except ImportError as exc:
+        raise ImportError(
+            "pyrealsense2 not found. Install: pip install pyrealsense2"
+        ) from exc
+
+    from utils.tracking_utils import (
+        build_estimator,
+        draw_tracking_vis,
+        get_sam3_mask,
+        intrinsics_to_K,
+        load_mesh,
+        load_sam3,
+        print_pose,
+        set_logging_format,
+        set_seed,
+    )
 
     set_logging_format()
     set_seed(0)
@@ -113,12 +119,59 @@ def main():
     pose = None
     initialized = False
     fps_hist: deque = deque(maxlen=30)
-    last_redetect_time = 0.0
 
-    logging.info(f"Tracking '{args.object}' — waiting for SAM3 detection...")
+    # Reason: SAM3 detection is expensive (~200ms). Run it once to get the
+    # initial mask, then hand off to FoundationPose for real-time tracking.
+    logging.info(f"Tracking '{args.object}' — running SAM3 for initial detection...")
+
+    # --- Phase 1: one-shot SAM3 detection for initial mask ---
+    while not initialized:
+        if display and display.closed:
+            break
+
+        frames = pipeline.wait_for_frames()
+        frames = align.process(frames)
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        if not depth_frame or not color_frame:
+            continue
+
+        color_bgr = np.asanyarray(color_frame.get_data())
+        color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        depth = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
+
+        mask = get_sam3_mask(sam_processor, color_rgb, args.object)
+        if mask is not None and mask.sum() > 100:
+            try:
+                pose = est.register(
+                    K=K,
+                    rgb=color_rgb,
+                    depth=depth,
+                    ob_mask=mask.astype(bool),
+                    iteration=args.est_refine_iter,
+                )
+                initialized = True
+                logging.info("Initial pose registered — switching to FP tracking")
+            except Exception as e:
+                logging.warning(f"Registration failed: {e}")
+
+        if display:
+            vis_bgr = draw_tracking_vis(
+                color_bgr, None, to_origin, bbox, K,
+                False, 0.0, args.object,
+            )
+            key = display.show(vis_bgr)
+            if key in ("q", "Escape"):
+                return
+
+    # --- Phase 2: real-time FoundationPose tracking (no SAM3) ---
+    logging.info("Entering real-time tracking loop (SAM3 is no longer running)")
 
     try:
         while True:
+            if display and display.closed:
+                break
+
             frames = pipeline.wait_for_frames()
             frames = align.process(frames)
             depth_frame = frames.get_depth_frame()
@@ -128,69 +181,37 @@ def main():
 
             color_bgr = np.asanyarray(color_frame.get_data())
             depth = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
-
-            if not args.no_flip:
-                color_bgr = cv2.flip(color_bgr, -1)
-                depth = cv2.flip(depth, -1)
-
             color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
             t0 = time.time()
 
-            if not initialized:
-                mask = get_sam3_mask(sam_processor, color_rgb, args.object)
-                if mask is not None and mask.sum() > 100:
-                    try:
-                        pose = est.register(
-                            K=K,
-                            rgb=color_rgb,
-                            depth=depth,
-                            ob_mask=mask.astype(bool),
-                            iteration=args.est_refine_iter,
-                        )
-                        initialized = True
-                        last_redetect_time = time.time()
-                        logging.info("Initial pose registered successfully")
-                    except Exception as e:
-                        logging.warning(f"Registration failed: {e}")
-            else:
-                try:
-                    pose = est.track_one(
-                        rgb=color_rgb,
-                        depth=depth,
-                        K=K,
-                        iteration=args.track_refine_iter,
-                    )
-                except Exception as e:
-                    logging.warning(f"Tracking failed: {e}")
-                    initialized = False
-                    continue
+            try:
+                pose = est.track_one(
+                    rgb=color_rgb,
+                    depth=depth,
+                    K=K,
+                    iteration=args.track_refine_iter,
+                )
+            except Exception as e:
+                logging.warning(f"Tracking failed: {e}")
+                initialized = False
+                pose = None
+                continue
 
-                if (
-                    args.redetect_interval > 0
-                    and (time.time() - last_redetect_time) >= args.redetect_interval
-                ):
-                    last_redetect_time = time.time()
-                    pose = check_drift_and_reregister(
-                        est, sam_processor, pose, color_rgb, depth, K,
-                        args.object, args.est_refine_iter,
-                    )
-
-                print_pose(pose, args.object)
+            print_pose(pose, args.object)
 
             dt = time.time() - t0
             fps_hist.append(1.0 / dt if dt > 1e-4 else 0.0)
             fps_val = sum(fps_hist) / len(fps_hist) if fps_hist else 0.0
 
-            if not args.no_vis:
+            if display:
                 vis_bgr = draw_tracking_vis(
                     color_bgr, pose, to_origin, bbox, K,
                     initialized, fps_val, args.object,
                 )
-                cv2.imshow("ObjectTracker", vis_bgr)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
+                key = display.show(vis_bgr)
+                if key in ("q", "Escape"):
                     break
-                if key == ord("r"):
+                if key == "r":
                     initialized = False
                     pose = None
                     logging.info("Tracking reset — waiting for SAM3 re-detection")
@@ -199,7 +220,8 @@ def main():
         logging.info("Interrupted by user")
     finally:
         pipeline.stop()
-        cv2.destroyAllWindows()
+        if display:
+            display.destroy()
         logging.info("Shutdown complete")
 
 

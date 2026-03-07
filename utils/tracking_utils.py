@@ -36,8 +36,27 @@ def load_sam3(confidence: float = 0.5):
     Returns:
         tuple: (model, processor) ready for inference.
     """
+    # Reason: the project root contains a sam3/ directory (the git repo) that
+    # Python finds as a namespace package, shadowing the real editable-installed
+    # sam3 package. Temporarily strip conflicting paths and clear any cached
+    # namespace entry so the real package in site-packages is resolved.
+    _sam3_shadow = str(PROJECT_ROOT / "sam3")
+    _conflicting = []
+    for p in list(sys.path):
+        resolved = str(Path(p).resolve()) if p else str(PROJECT_ROOT)
+        if Path(resolved) == PROJECT_ROOT or Path(resolved) == Path(_sam3_shadow):
+            _conflicting.append(p)
+            sys.path.remove(p)
+
+    for key in [k for k in sys.modules if k == "sam3" or k.startswith("sam3.")]:
+        del sys.modules[key]
+
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
+
+    for p in _conflicting:
+        if p not in sys.path:
+            sys.path.append(p)
 
     logging.info("Loading SAM3 model (this may take a moment on first run)...")
     model = build_sam3_image_model(
@@ -85,6 +104,10 @@ def get_sam3_mask(
 
     if mask_np.sum() == 0:
         return None
+
+    # Reason: CUDA kernels may still be in-flight; synchronize before
+    # returning to caller so cv2.imshow doesn't race with the GPU.
+    torch.cuda.synchronize()
 
     logging.info(
         f"SAM3 detected '{object_name}' with score {scores[best_idx]:.3f}, "
@@ -267,56 +290,3 @@ def draw_tracking_vis(
     return vis_bgr
 
 
-def check_drift_and_reregister(
-    est: FoundationPose,
-    sam_processor,
-    pose: np.ndarray,
-    color_rgb: np.ndarray,
-    depth: np.ndarray,
-    K: np.ndarray,
-    object_name: str,
-    est_refine_iter: int,
-    drift_threshold: float = 50.0,
-) -> np.ndarray:
-    """
-    Run SAM3 re-detection and re-register if tracking has drifted.
-
-    Args:
-        est: FoundationPose estimator.
-        sam_processor: Sam3Processor instance.
-        pose (np.ndarray): Current 4x4 pose estimate.
-        color_rgb (np.ndarray): Current RGB frame.
-        depth (np.ndarray): Current depth map (meters).
-        K (np.ndarray): Camera intrinsics (3, 3).
-        object_name (str): Text prompt for SAM3.
-        est_refine_iter (int): Refinement iterations for registration.
-        drift_threshold (float): Pixel distance threshold to trigger re-registration.
-
-    Returns:
-        np.ndarray: Updated (or unchanged) 4x4 pose.
-    """
-    mask = get_sam3_mask(sam_processor, color_rgb, object_name)
-    if mask is None or mask.sum() <= 100:
-        return pose
-
-    mask_ys, mask_xs = np.where(mask > 0)
-    sam_center = np.array([mask_xs.mean(), mask_ys.mean()])
-    obj_3d = pose[:3, 3]
-    obj_2d = K @ obj_3d
-    tracked_center = obj_2d[:2] / obj_2d[2]
-
-    dist = np.linalg.norm(sam_center - tracked_center)
-    if dist > drift_threshold:
-        logging.info(f"Drift detected ({dist:.0f}px), re-registering...")
-        try:
-            pose = est.register(
-                K=K,
-                rgb=color_rgb,
-                depth=depth,
-                ob_mask=mask.astype(bool),
-                iteration=est_refine_iter,
-            )
-        except Exception as e:
-            logging.warning(f"Re-registration failed: {e}")
-
-    return pose

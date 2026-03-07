@@ -8,7 +8,7 @@ pybind11>=2.12
 
 # Computer Vision
 imageio>=2.34
-opencv-python>=4.9
+opencv-python-headless>=4.9
 open3d>=0.18
 trimesh>=4.2
 

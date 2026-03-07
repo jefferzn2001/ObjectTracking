@@ -1,15 +1,14 @@
 # ObjectTracking
 
-Real-time 6-DoF object pose tracking using **SAM3** for automatic detection and **FoundationPose** for pose estimation. Works standalone (console output) or with ROS (`PoseStamped` publishing).
+Real-time 6-DoF object pose tracking using **SAM3** for automatic detection and **FoundationPose** for pose estimation. Works standalone (console output) or with ROS2 (`PoseStamped` publishing).
 
 ## How It Works
 
 1. You provide an object name (e.g., `--object cup`) that matches a folder in `object/`
 2. **SAM3** uses the object name as a text prompt to detect and segment the object in the camera feed
 3. **FoundationPose** computes the initial 6-DoF pose from the segmentation mask
-4. Subsequent frames use FoundationPose's fast tracking mode
-5. Pose is either printed to console (`track_object.py`) or published via ROS (`track_object_ros.py`)
-6. Periodic SAM3 re-detection recovers from tracking drift
+4. Subsequent frames use FoundationPose's fast tracking mode (no more SAM3)
+5. Pose is either printed to console (`track_object.py`) or published via ROS2 (`track_object_ros.py`)
 
 ## Project Structure
 
@@ -24,10 +23,12 @@ ObjectTracking/
 │   ├── weights/             # Pretrained model weights
 │   └── ...
 ├── sam3/                    # Segment Anything Model 3 (Facebook)
+├── utils/
+│   └── tracking_utils.py    # Shared: SAM3, FP, camera, vis helpers
 ├── scripts/
-│   ├── tracking_utils.py    # Shared: SAM3, FP, camera, vis helpers
+│   ├── sam3_view.py          # Interactive SAM3 segmentation viewer
 │   ├── track_object.py      # Standalone tracker (no ROS)
-│   └── track_object_ros.py  # ROS tracker (publishes PoseStamped)
+│   └── track_object_ros.py  # ROS2 tracker (publishes PoseStamped)
 └── tests/
 ```
 
@@ -36,7 +37,7 @@ ObjectTracking/
 - Ubuntu 22.04
 - NVIDIA GPU with CUDA 12.x driver (tested: RTX 4070 / 5090, driver 575+)
 - Intel RealSense D435 camera
-- ROS Noetic (only for `track_object_ros.py`, not needed for standalone)
+- ROS2 Humble (only for `track_object_ros.py`, not needed for standalone)
 
 ## Installation
 
@@ -76,9 +77,12 @@ You should see the RGB and depth streams from your camera. Close the viewer befo
 ### Step 2: Create conda environment
 
 ```bash
-conda create -n objtrack python=3.9 -y
+conda create -n objtrack python=3.10 -y
 conda activate objtrack
 ```
+
+> **Why Python 3.10?** ROS2 Humble's `rclpy` is compiled against Python 3.10
+> (Ubuntu 22.04's system Python). Using 3.10 in the conda env ensures compatibility.
 
 ### Step 3: Install PyTorch (CUDA 12.4)
 
@@ -88,8 +92,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 > **Note on GPU compatibility**: PyTorch CUDA 12.4 wheels work on any NVIDIA driver
 > that supports CUDA 12.x (driver 525+). This includes RTX 4070, 5090, and all
-> other modern GPUs. The Python version (3.9) is independent of the GPU -- GPUs
-> only care about the CUDA driver, not Python.
+> other modern GPUs.
 
 ### Step 4: Install FoundationPose dependencies
 
@@ -102,14 +105,14 @@ conda install conda-forge::eigen=3.4.0 -y
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Install NVDiffRast (GPU rasterizer)
-pip install git+https://github.com/NVlabs/nvdiffrast.git
+# Install NVDiffRast (GPU rasterizer -- needs --no-build-isolation to see PyTorch)
+pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
 
 # Install PyTorch3D (build from source -- takes a few minutes)
-pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git"
 
 # Build FoundationPose C++ extensions
-export CMAKE_PREFIX_PATH="$CONDA_PREFIX/lib/python3.9/site-packages/pybind11/share/cmake/pybind11:$CMAKE_PREFIX_PATH"
+export CMAKE_PREFIX_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/pybind11/share/cmake/pybind11:$CMAKE_PREFIX_PATH"
 bash build_all_conda.sh
 
 cd ..
@@ -119,9 +122,9 @@ cd ..
 
 ```bash
 # SAM3 checkpoints are on Hugging Face (requires access approval)
-pip install huggingface_hub
-huggingface-cli login
 # Go to https://huggingface.co/facebook/sam3 and request access first
+pip install huggingface_hub
+python -c "from huggingface_hub import login; login()"
 
 # Install SAM3
 cd sam3
@@ -132,7 +135,7 @@ cd ..
 ### Step 6: Install remaining tools
 
 ```bash
-pip install pyrealsense2 scipy
+pip install pyrealsense2 scipy psutil transformations ruamel.yaml decord pycocotools warp-lang
 ```
 
 ### Step 7: Download FoundationPose weights
@@ -158,10 +161,6 @@ python -c "import sys; sys.path.insert(0, 'FoundationPose'); from estimater impo
 python -c "from sam3 import build_sam3_image_model; print('SAM3 OK')"
 ```
 
-## Camera Intrinsics
-
-**You do NOT need to manually configure camera intrinsics.** The scripts automatically read the D435's factory-calibrated intrinsics (fx, fy, cx, cy) via `pyrealsense2` at startup. Depth is also automatically aligned to the color frame. No ROS camera node is needed -- the scripts talk to the camera directly.
-
 ## Adding Your Own Objects
 
 Place your object's mesh files in `object/<name>/`:
@@ -177,10 +176,27 @@ The `--object` argument must match the folder name. SAM3 uses this same name as 
 
 ## Usage
 
+### SAM3 Viewer (interactive, no FoundationPose needed)
+
+Test what SAM3 can see before doing any tracking. Opens the camera feed and lets you type prompts in the terminal.
+
+```bash
+conda activate objtrack
+cd ~/Desktop/ObjectTracking
+
+python scripts/sam3_view.py
+# Then type prompts in the terminal:
+#   prompt> cup
+#   prompt> cup, bottle, phone     (comma-separate for multiple)
+#   prompt> clear                  (remove all)
+#   prompt> quit                   (exit)
+```
+
 ### Standalone (no ROS)
 
 ```bash
 conda activate objtrack
+cd ~/Desktop/ObjectTracking
 
 # Basic tracking -- prints pose to console, shows visualization
 python scripts/track_object.py --object cup
@@ -188,29 +204,41 @@ python scripts/track_object.py --object cup
 # Lower detection confidence for harder objects
 python scripts/track_object.py --object can --confidence 0.3
 
-# Headless mode (no OpenCV window)
+# Headless mode (no visualization window)
 python scripts/track_object.py --object cup --no-vis
-
-# Disable image flip (default flips for upside-down mounted cameras)
-python scripts/track_object.py --object cup --no-flip
 ```
 
-### With ROS
+### With ROS2
 
-Requires ROS Noetic. In a separate terminal, start `roscore` first.
+Requires ROS2 Humble installed on your system (`sudo apt install ros-humble-desktop`).
+
+> **Important**: You must `source /opt/ros/humble/setup.bash` **before** `conda activate`
+> so that `rclpy` and ROS2 Python packages are visible to your conda Python.
+
+**Terminal 1** — Run the tracker:
 
 ```bash
+source /opt/ros/humble/setup.bash
 conda activate objtrack
+cd ~/Desktop/ObjectTracking
 
 # Publish to /object_pose
 python scripts/track_object_ros.py --object cup
 
 # Custom topic and confidence
 python scripts/track_object_ros.py --object can --topic /can_pose --confidence 0.4
-
-# Adjust re-detection interval (seconds, 0 = disabled)
-python scripts/track_object_ros.py --object cup --redetect_interval 10
 ```
+
+**Terminal 2** — View the topic:
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 topic echo /object_pose
+ros2 topic hz /object_pose
+```
+
+> **Note**: You must `source /opt/ros/humble/setup.bash` in **every** new terminal
+> that uses ROS2 commands. No `roscore` is needed — ROS2 uses DDS discovery.
 
 ### Keyboard Controls (when visualization is enabled)
 
@@ -219,7 +247,7 @@ python scripts/track_object_ros.py --object cup --redetect_interval 10
 | `q` / `ESC` | Quit |
 | `r` | Reset tracking (triggers SAM3 re-detection) |
 
-### ROS Topic Output
+### ROS2 Topic Output
 
 | Topic | Type | Description |
 |-------|------|-------------|
@@ -229,18 +257,6 @@ The pose contains:
 - `position`: (x, y, z) in meters, in camera optical frame
 - `orientation`: quaternion (x, y, z, w)
 - `header.frame_id`: `camera_color_optical_frame` (default)
-
-## Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| `No .obj file found` | Check `object/<name>/` has a `.obj` file |
-| `Found 0 device(s)` | Plug D435 into a **USB 3.0** port (blue port). Try `realsense-viewer` first |
-| SAM3 not detecting | Lower `--confidence` (try `0.2`), or use a more descriptive object name |
-| Slow FPS | Reduce `--track_refine_iter 1` for speed at some accuracy cost |
-| CUDA out of memory | Close other GPU apps. Both models together need ~8-10 GB VRAM |
-| `pyrealsense2` import error | Run `pip install pyrealsense2` or check the SDK installed in Step 1 |
-| FoundationPose C++ build fails | Check `conda list eigen` shows 3.4.0, and that `CMAKE_PREFIX_PATH` is set |
 
 ## License
 
