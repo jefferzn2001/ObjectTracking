@@ -196,6 +196,44 @@ def build_estimator(
     return est, mesh, to_origin, bbox
 
 
+def load_camera_serial(name: Optional[str] = None) -> Optional[str]:
+    """
+    Look up a RealSense serial number from camera_config.yaml.
+
+    Args:
+        name (Optional[str]): Camera name (e.g. ``"robotcam"``).
+            If None, returns None immediately (use any available camera).
+
+    Returns:
+        Optional[str]: Serial number string, or None to use any camera.
+    """
+    if not name:
+        return None
+
+    config_path = PROJECT_ROOT / "camera_config.yaml"
+    if not config_path.exists():
+        logging.warning(
+            f"camera_config.yaml not found — cannot look up '{name}'. "
+            "Using any available camera."
+        )
+        return None
+
+    import yaml
+
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    cameras = cfg.get("cameras", {})
+    if name not in cameras:
+        available = list(cameras.keys())
+        logging.error(f"Camera '{name}' not in config. Available: {available}")
+        return None
+
+    serial = cameras[name]["serial"]
+    logging.info(f"Using camera '{name}' (serial {serial})")
+    return serial
+
+
 def intrinsics_to_K(intr) -> np.ndarray:
     """
     Convert RealSense intrinsics to a 3x3 camera matrix.

@@ -1,6 +1,7 @@
 # Project files (not tracked)
 PLANNING.md
 TASK.md
+camera_config.yaml
 
 # Python
 __pycache__/

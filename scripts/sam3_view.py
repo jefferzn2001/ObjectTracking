@@ -152,12 +152,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="Interactive SAM3 viewer with live RealSense camera"
     )
-    parser.add_argument("--width", type=int, default=640, help="Camera width")
-    parser.add_argument("--height", type=int, default=480, help="Camera height")
+    parser.add_argument("--width", type=int, default=1280, help="Camera width")
+    parser.add_argument("--height", type=int, default=720, help="Camera height")
     parser.add_argument("--fps", type=int, default=30, help="Camera FPS")
     parser.add_argument(
         "--confidence", type=float, default=0.3,
         help="SAM3 detection confidence threshold (lower = more detections)",
+    )
+    parser.add_argument(
+        "--camera", type=str, default=None,
+        help="Camera name from camera_config.yaml (e.g. robotcam, tablecam). "
+             "Default uses the 'default' key in the config.",
     )
     args = parser.parse_args()
 
@@ -185,8 +190,14 @@ def main():
 
     import pyrealsense2 as rs
 
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from utils.tracking_utils import load_camera_serial
+
     pipeline = rs.pipeline()
     config = rs.config()
+    serial = load_camera_serial(args.camera)
+    if serial:
+        config.enable_device(serial)
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
     profile = pipeline.start(config)
     logging.info(f"RealSense started: {args.width}x{args.height}@{args.fps}fps")
