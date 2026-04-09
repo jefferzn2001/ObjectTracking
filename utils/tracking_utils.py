@@ -1,7 +1,7 @@
 """
 Shared utilities for object tracking scripts.
 
-Contains SAM3 loading/inference, mesh loading, FoundationPose estimator
+Contains SAM2 click-to-segment, mesh loading, FoundationPose estimator
 construction, camera intrinsics helpers, and visualization.
 """
 
@@ -26,91 +26,61 @@ from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import draw_posed_3d_box, draw_xyz_axis, set_logging_format, set_seed
 
 
-def load_sam3(confidence: float = 0.5):
-    """
-    Load SAM3 model and processor for text-prompted segmentation.
+def load_sam2(model_name: str = "sam2.1_b.pt"):
+    """Load SAM2 model via ultralytics for point-prompted segmentation.
+
+    Looks for the weights file in ``ObjectTracking/<model_name>`` first,
+    falling back to ultralytics auto-download if not found locally.
 
     Args:
-        confidence (float): Detection confidence threshold.
+        model_name: SAM2 checkpoint filename.
 
     Returns:
-        tuple: (model, processor) ready for inference.
+        ultralytics.models.sam.SAM: Ready-to-use SAM2 model.
     """
-    # Reason: the project root contains a sam3/ directory (the git repo) that
-    # Python finds as a namespace package, shadowing the real editable-installed
-    # sam3 package. Temporarily strip conflicting paths and clear any cached
-    # namespace entry so the real package in site-packages is resolved.
-    _sam3_shadow = str(PROJECT_ROOT / "sam3")
-    _conflicting = []
-    for p in list(sys.path):
-        resolved = str(Path(p).resolve()) if p else str(PROJECT_ROOT)
-        if Path(resolved) == PROJECT_ROOT or Path(resolved) == Path(_sam3_shadow):
-            _conflicting.append(p)
-            sys.path.remove(p)
+    from ultralytics import SAM
 
-    for key in [k for k in sys.modules if k == "sam3" or k.startswith("sam3.")]:
-        del sys.modules[key]
-
-    from sam3 import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
-
-    for p in _conflicting:
-        if p not in sys.path:
-            sys.path.append(p)
-
-    logging.info("Loading SAM3 model (this may take a moment on first run)...")
-    model = build_sam3_image_model(
-        device="cuda",
-        eval_mode=True,
-        enable_segmentation=True,
-    )
-    processor = Sam3Processor(model, confidence_threshold=confidence)
-    logging.info("SAM3 model loaded")
-    return model, processor
+    local_path = PROJECT_ROOT / model_name
+    weight_path = str(local_path) if local_path.exists() else model_name
+    logging.info(f"Loading SAM2 model ({weight_path}) ...")
+    model = SAM(weight_path)
+    logging.info("SAM2 model loaded")
+    return model
 
 
-def get_sam3_mask(
-    processor,
+def get_click_mask(
+    sam_model,
     color_rgb: np.ndarray,
-    object_name: str,
+    click_xy: tuple[int, int],
 ) -> Optional[np.ndarray]:
-    """
-    Use SAM3 text-prompted segmentation to find and segment the object.
+    """Generate a segmentation mask from a single point click.
 
     Args:
-        processor: Sam3Processor instance.
-        color_rgb (np.ndarray): RGB image (H, W, 3), uint8.
-        object_name (str): Text prompt for the object to detect.
+        sam_model: Ultralytics SAM model returned by :func:`load_sam2`.
+        color_rgb: RGB image (H, W, 3), uint8.
+        click_xy: (x, y) pixel coordinate of the user click.
 
     Returns:
-        Optional[np.ndarray]: Binary mask (H, W) as uint8 (0 or 1),
-                              or None if no detection.
+        Binary mask (H, W) as uint8 (0 or 1), or None on failure.
     """
-    from PIL import Image
-
-    pil_image = Image.fromarray(color_rgb)
-    inference_state = processor.set_image(pil_image)
-    output = processor.set_text_prompt(state=inference_state, prompt=object_name)
-
-    masks = output["masks"]
-    scores = output["scores"]
-
-    if masks is None or len(masks) == 0:
+    results = sam_model(
+        color_rgb,
+        points=[[click_xy[0], click_xy[1]]],
+        labels=[1],
+        verbose=False,
+    )
+    if not results or results[0].masks is None:
         return None
 
-    # Reason: pick highest-confidence detection if multiple instances found
-    best_idx = torch.argmax(scores).item()
-    mask_np = masks[best_idx, 0].cpu().numpy().astype(np.uint8)
+    mask_tensor = results[0].masks.data[0]
+    mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
 
-    if mask_np.sum() == 0:
+    if mask_np.sum() < 100:
         return None
 
-    # Reason: CUDA kernels may still be in-flight; synchronize before
-    # returning to caller so cv2.imshow doesn't race with the GPU.
     torch.cuda.synchronize()
-
     logging.info(
-        f"SAM3 detected '{object_name}' with score {scores[best_idx]:.3f}, "
+        f"SAM2 segmented click ({click_xy[0]}, {click_xy[1]}), "
         f"mask pixels: {mask_np.sum()}"
     )
     return mask_np
